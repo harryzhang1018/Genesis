@@ -3,6 +3,7 @@ import math
 import igl
 import numpy as np
 import pytest
+import quadrants as qd
 import torch
 
 import genesis as gs
@@ -197,6 +198,7 @@ def test_offset_pos(box_obj_path, show_viewer):
     [
         (gs.options.SAPCouplerOptions, "linear"),
         (gs.options.SAPCouplerOptions, "linear_corotated"),
+        (gs.options.SAPCouplerOptions, "stable_neohookean"),
         (gs.options.LegacyCouplerOptions, "linear"),
     ],
 )
@@ -270,7 +272,7 @@ def test_implicit_falling_sphere_box(coupler_type, material_model, show_viewer):
         BV, *_ = igl.bounding_box(pos)
         entity_center = 0.5 * (BV[0] + BV[-1])
         if coupler_type == gs.options.SAPCouplerOptions:
-            tol = 1e-2 if material_model == "linear_corotated" else 1e-3
+            tol = 1e-3 if material_model == "linear" else 1e-2
         else:
             tol = 5e-3
         assert_allclose(entity_center[:2], init_pos[:2], tol=tol)
@@ -286,6 +288,82 @@ def test_implicit_falling_sphere_box(coupler_type, material_model, show_viewer):
         penetration_depth_ref = 0.0
         tol = 1e-3 if coupler_type == gs.options.SAPCouplerOptions else 0.05
         assert_allclose(-state.pos[..., 2].min(), penetration_depth_ref, tol=tol)
+
+
+@pytest.mark.required
+@pytest.mark.parametrize("precision", ["64"])
+def test_implicit_stable_neohookean_derivatives_fd(precision):
+    """The implicit-path stable-Neo-Hookean gradient and Hessian are the true derivatives
+    of `_compute_energy_stable_neohookean`, checked by central finite differences.
+
+    This also pins the element-Hessian storage convention for the first time:
+    `hessian_field[i_b, b, d, i_e][a, c] == d2 Psi / dF_ab dF_cd` (the outer field indices
+    are the *columns* of F, the inner matrix indices its rows).
+    """
+    mat = gs.materials.FEM.Elastic(E=1e5, nu=0.45, model="stable_neohookean")
+
+    f_in = qd.Matrix.field(3, 3, dtype=gs.qd_float, shape=())
+    e_out = qd.field(gs.qd_float, shape=())
+    g_out = qd.Matrix.field(3, 3, dtype=gs.qd_float, shape=())
+    h_field = qd.field(dtype=gs.qd_mat3, shape=(1, 3, 3, 1))
+
+    @qd.kernel
+    def eval_energy(mu: gs.qd_float, lam: gs.qd_float):
+        F = f_in[None]
+        J = F.determinant()
+        m_dir = qd.Vector([0.0, 0.0, 1.0])
+        e_out[None] = mat.compute_energy(mu=mu, lam=lam, J=J, F=F, actu=0.0, m_dir=m_dir, i_e=0, i_b=0)
+
+    @qd.kernel
+    def eval_grad_hess(mu: gs.qd_float, lam: gs.qd_float):
+        F = f_in[None]
+        J = F.determinant()
+        m_dir = qd.Vector([0.0, 0.0, 1.0])
+        e, g = mat.compute_energy_gradient_hessian(
+            mu=mu, lam=lam, J=J, F=F, actu=0.0, m_dir=m_dir, i_e=0, i_b=0, hessian_field=h_field
+        )
+        e_out[None] = e
+        g_out[None] = g
+
+    def energy_at(F):
+        f_in.from_numpy(F)
+        eval_energy(mat.mu, mat.lam)
+        return float(e_out.to_numpy())
+
+    def grad_hess_at(F):
+        f_in.from_numpy(F)
+        eval_grad_hess(mat.mu, mat.lam)
+        gradient = g_out.to_numpy()
+        h = h_field.to_numpy()  # (i_b, colA, colB, i_e, rowA, rowB)
+        h9 = np.empty((9, 9))
+        for a in range(3):
+            for b in range(3):
+                for c in range(3):
+                    for d in range(3):
+                        h9[3 * a + b, 3 * c + d] = h[0, b, d, 0, a, c]
+        return gradient, h9
+
+    rng = np.random.default_rng(0)
+    states = [np.eye(3) + 0.1 * rng.standard_normal((3, 3)) for _ in range(4)]
+    states.append(np.diag([0.6, 0.7, 0.8]))  # strong compression, J < 1
+    for F in states:
+        gradient, h9 = grad_hess_at(F)
+        assert_allclose(h9, h9.T, tol=1e-12 * np.abs(h9).max())
+
+        direction = rng.standard_normal((3, 3))
+        direction /= np.linalg.norm(direction)
+        analytic_g = float((gradient * direction).sum())
+        analytic_h = float(direction.reshape(9) @ h9 @ direction.reshape(9))
+        best_g = best_h = np.inf
+        for eps in (1e-4, 1e-5, 1e-6):
+            fd_g = (energy_at(F + eps * direction) - energy_at(F - eps * direction)) / (2 * eps)
+            best_g = min(best_g, abs(fd_g - analytic_g) / abs(analytic_g))
+            g_plus, _ = grad_hess_at(F + eps * direction)
+            g_minus, _ = grad_hess_at(F - eps * direction)
+            fd_h = float(((g_plus - g_minus) * direction).sum()) / (2 * eps)
+            best_h = min(best_h, abs(fd_h - analytic_h) / abs(analytic_h))
+        assert best_g < 1e-7, f"gradient FD best relative error {best_g:.3e}"
+        assert best_h < 1e-7, f"Hessian FD best relative error {best_h:.3e}"
 
 
 @pytest.mark.required

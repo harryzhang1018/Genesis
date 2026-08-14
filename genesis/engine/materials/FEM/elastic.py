@@ -157,11 +157,53 @@ class Elastic(Base):
 
     @qd.func
     def _compute_energy_gradient_hessian_stable_neohookean(self, mu, lam, J, F, actu, m_dir, i_e, i_b, hessian_field):
-        raise NotImplementedError("Hessian computation is not implemented for stable_neohookean model.")
+        _lambda = lam + mu
+        _alpha = 1.0 + mu / _lambda
+        Ic = F.norm_sqr()
+        Jminus1 = J - _alpha
+        energy = 0.5 * (mu * (Ic - 3.0) + _lambda * Jminus1**2)
+        pJpF = partialJpartialF(F)
+        gradient = mu * F + _lambda * Jminus1 * pJpF
+
+        # H_abcd = d2Psi/dF_ab dF_cd = mu delta_ac delta_bd + lambda pJpF_ab pJpF_cd
+        #        + lambda (J - alpha) d2J/dF_ab dF_cd,
+        # stored as hessian_field[i_b, b, d, i_e][a, c] (outer indices are columns of F).
+        for i in qd.static(qd.grouped(qd.ndrange(3, 3))):
+            hessian_field[i_b, i, i_e].fill(0.0)
+
+        for i, k in qd.static(qd.ndrange(3, 3)):
+            hessian_field[i_b, i, i, i_e][k, k] = mu
+
+        for b, d in qd.static(qd.ndrange(3, 3)):
+            hessian_field[i_b, b, d, i_e] += _lambda * pJpF[:, b].outer_product(pJpF[:, d])
+
+        # d2J/dF_ab dF_cd = eps_ace eps_bdf F_ef, written without inverting F so it stays
+        # valid at J <= 0 (intermediate Newton iterates may invert elements): for each
+        # column pair (b, d) with b != d the (a, c) block is the cross-product matrix of
+        # F's remaining column f = 3 - b - d, signed by eps_bdf.
+        w = _lambda * Jminus1
+        for b, d in qd.static(qd.ndrange(3, 3)):
+            if b != d:
+                f = 3 - b - d
+                s = w if (d - b) % 3 == 1 else -w
+                hessian_field[i_b, b, d, i_e][0, 1] += s * F[2, f]
+                hessian_field[i_b, b, d, i_e][0, 2] -= s * F[1, f]
+                hessian_field[i_b, b, d, i_e][1, 0] -= s * F[2, f]
+                hessian_field[i_b, b, d, i_e][1, 2] += s * F[0, f]
+                hessian_field[i_b, b, d, i_e][2, 0] += s * F[1, f]
+                hessian_field[i_b, b, d, i_e][2, 1] -= s * F[0, f]
+
+        return energy, gradient
 
     @qd.func
     def _compute_energy_gradient_stable_neohookean(self, mu, lam, J, F, actu, m_dir, i_e, i_b):
-        gs.raise_exception("Gradient computation is not implemented for stable_neohookean model.")
+        _lambda = lam + mu
+        _alpha = 1.0 + mu / _lambda
+        Ic = F.norm_sqr()
+        Jminus1 = J - _alpha
+        energy = 0.5 * (mu * (Ic - 3.0) + _lambda * Jminus1**2)
+        gradient = mu * F + _lambda * Jminus1 * partialJpartialF(F)
+        return energy, gradient
 
     @qd.func
     def _compute_energy_stable_neohookean(self, mu, lam, J, F, actu, m_dir, i_e, i_b):
